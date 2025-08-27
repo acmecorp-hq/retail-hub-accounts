@@ -1,0 +1,580 @@
+openapi: 3.1.0
+info:
+  title: Retail Hub — Accounts API
+  version: 1.0.0
+  description: |
+    The Accounts service provides user registration, authentication (JWT), and self-service profile management.
+    Authentication supports Bearer tokens and (optionally) an httpOnly session cookie.
+    Token lifetime defaults to 24 hours. All endpoints are JSON over HTTPS.
+
+    Implementation notes (non-normative):
+    - Phase 1 storage: SQL-compatible in-memory database (e.g., sqlite ':memory:').
+    - Phase 2 storage: PostgreSQL (per-service database `accounts_db`) with identical schema.
+    - Passwords must be stored as strong hashes (argon2id or bcrypt) and never returned by the API.
+
+  contact:
+    name: ACME Corp HQ
+    url: https://github.com/acmecorp-hq
+  license:
+    name: Proprietary
+servers:
+  - url: https://api.retail-hub.com/v1/accounts
+    description: Production
+  - url: http://localhost:{port}/v1/accounts
+    description: Local development
+    variables:
+      port:
+        default: "8080"
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+
+tags:
+  - name: Auth
+    description: Registration, login, logout
+  - name: Users
+    description: Authenticated user profile
+  - name: Health
+    description: Liveness and readiness
+
+security:
+  # Either Bearer JWT OR cookie-based session is accepted for protected endpoints
+  - bearerAuth: []
+  - cookieAuth: []
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      description: Creates a user account and returns the public user representation.
+      operationId: register
+      security: []  # Public
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            examples:
+              example:
+                value:
+                  username: "jane.doe"
+                  email: "jane@example.com"
+                  password: "Str0ngPassw0rd!"
+                  profile:
+                    givenName: "Jane"
+                    familyName: "Doe"
+      responses:
+        '201':
+          description: User created
+          headers:
+            Location:
+              description: URL of the created resource
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              examples:
+                example:
+                  value:
+                    id: "usr_7b4e8a8a-2ec8-4d1b-9e3c-9ae7d8a75321"
+                    username: "jane.doe"
+                    email: "jane@example.com"
+                    profile:
+                      givenName: "Jane"
+                      familyName: "Doe"
+                    createdAt: "2025-08-27T12:00:00Z"
+                    updatedAt: "2025-08-27T12:00:00Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Username or email already exists
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+              examples:
+                conflict:
+                  value:
+                    type: "https://api.retail-hub.com/problems/conflict"
+                    title: "Conflict"
+                    status: 409
+                    detail: "Username or email already exists."
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate with username/email and password
+      description: |
+        Verifies credentials and returns a JWT along with optional `Set-Cookie` for httpOnly session (`rh_session`).
+        Clients may use either the Bearer token or the cookie on subsequent requests.
+      operationId: login
+      security: []  # Public
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              example:
+                value:
+                  usernameOrEmail: "jane@example.com"
+                  password: "Str0ngPassw0rd!"
+      responses:
+        '200':
+          description: Authenticated
+          headers:
+            Set-Cookie:
+              description: |
+                Optional httpOnly session cookie (`rh_session=<jwt>; HttpOnly; Secure; SameSite=Lax`).
+                Presence depends on server configuration.
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              examples:
+                example:
+                  value:
+                    token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    tokenType: "Bearer"
+                    expiresIn: 86400
+                    user:
+                      id: "usr_7b4e8a8a-2ec8-4d1b-9e3c-9ae7d8a75321"
+                      username: "jane.doe"
+                      email: "jane@example.com"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout (best-effort)
+      description: |
+        Instructs the client to remove its session. For cookie-based auth, server clears the `rh_session` cookie.
+        For stateless JWT, clients should discard the token. Implementations MAY keep a short-term denylist.
+      operationId: logout
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '204':
+          description: Logged out (no content)
+          headers:
+            Set-Cookie:
+              description: Optional cookie clear instruction (`rh_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`)
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get current user profile
+      operationId: getMe
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+      responses:
+        '200':
+          description: Current user
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Users]
+      summary: Update current user profile
+      description: Updates mutable fields of the profile. Email and username changes may be constrained by policy.
+      operationId: updateMe
+      parameters:
+        - $ref: '#/components/parameters/XRequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdateRequest'
+            examples:
+              example:
+                value:
+                  email: "jane.new@example.com"
+                  profile:
+                    givenName: "Jane"
+                    familyName: "Doe"
+                    avatarUrl: "https://cdn.example.com/avatars/jane.png"
+      responses:
+        '200':
+          description: Updated user
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Email or username conflicts with an existing account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      security: []  # Public
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                ok:
+                  value:
+                    status: "ok"
+                    service: "accounts"
+                    time: "2025-08-27T12:00:00Z"
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      security: []  # Public
+      responses:
+        '200':
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                ready:
+                  value:
+                    status: "ready"
+                    service: "accounts"
+                    time: "2025-08-27T12:00:00Z"
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              examples:
+                notReady:
+                  value:
+                    status: "not_ready"
+                    service: "accounts"
+                    time: "2025-08-27T12:00:00Z"
+                    details:
+                      db: "connecting"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: HS256 JWT. Default expiry 24h.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: rh_session
+      description: httpOnly cookie carrying a JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Optional idempotency key for safely retrying POST requests.
+      schema:
+        type: string
+        maxLength: 128
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Optional request correlation ID. Echoed back in responses.
+      schema:
+        type: string
+
+  headers:
+    XRequestId:
+      description: Correlation ID for tracing requests end-to-end.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Validation failed or malformed request
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            validation:
+              value:
+                type: "https://api.retail-hub.com/problems/validation"
+                title: "Bad Request"
+                status: 400
+                detail: "email must be a valid email address; password must be at least 8 characters."
+                errors:
+                  - path: "/email"
+                    message: "invalid email"
+    Unauthorized:
+      description: Missing or invalid authentication
+      headers:
+        WWW-Authenticate:
+          description: Bearer authentication challenge
+          schema:
+            type: string
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            unauthorized:
+              value:
+                type: "https://api.retail-hub.com/problems/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "Missing or invalid credentials."
+    NotFound:
+      description: Resource not found
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          description: Seconds until the next allowed request
+          schema:
+            type: integer
+        X-RateLimit-Limit:
+          description: Total request limit in the current window
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          description: Remaining requests in the current window
+          schema:
+            type: integer
+        X-RateLimit-Reset:
+          description: Epoch seconds when the window resets
+          schema:
+            type: integer
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServerError:
+      description: Unexpected server error
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [username, email, password]
+      properties:
+        username:
+          $ref: '#/components/schemas/Username'
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+          description: Plaintext password to be hashed server-side (argon2id or bcrypt).
+        profile:
+          $ref: '#/components/schemas/UserProfile'
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [usernameOrEmail, password]
+      properties:
+        usernameOrEmail:
+          type: string
+          minLength: 3
+          maxLength: 254
+          description: Username or email for login.
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          writeOnly: true
+    LoginResponse:
+      type: object
+      additionalProperties: false
+      required: [token, tokenType, expiresIn, user]
+      properties:
+        token:
+          type: string
+          description: HS256 JWT
+        tokenType:
+          type: string
+          enum: [Bearer]
+        expiresIn:
+          type: integer
+          description: Token expiry in seconds (default 86400)
+          example: 86400
+        user:
+          $ref: '#/components/schemas/User'
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, username, email, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/UserId'
+        username:
+          $ref: '#/components/schemas/Username'
+        email:
+          $ref: '#/components/schemas/Email'
+        profile:
+          $ref: '#/components/schemas/UserProfile'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    UserUpdateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        username:
+          $ref: '#/components/schemas/Username'
+        email:
+          $ref: '#/components/schemas/Email'
+        profile:
+          $ref: '#/components/schemas/UserProfile'
+      description: Partial update. Only provided fields are updated.
+    UserProfile:
+      type: object
+      additionalProperties: false
+      properties:
+        givenName:
+          type: string
+          maxLength: 100
+        familyName:
+          type: string
+          maxLength: 100
+        avatarUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+        address:
+          type: object
+          additionalProperties: false
+          properties:
+            line1: { type: string, maxLength: 200 }
+            line2: { type: string, maxLength: 200 }
+            city:  { type: string, maxLength: 100 }
+            state: { type: string, maxLength: 100 }
+            postalCode: { type: string, maxLength: 20 }
+            country: { type: string, maxLength: 2, description: ISO 3166-1 alpha-2 }
+    Username:
+      type: string
+      pattern: '^[a-zA-Z0-9._-]{3,30}$'
+      description: 3–30 chars; letters, numbers, dot, underscore, hyphen.
+    Email:
+      type: string
+      format: email
+      maxLength: 254
+    UserId:
+      type: string
+      format: uuid
+    Timestamp:
+      type: string
+      format: date-time
+    Health:
+      type: object
+      additionalProperties: true
+      properties:
+        status:
+          type: string
+          enum: [ok, ready, not_ready]
+        service:
+          type: string
+          example: accounts
+        time:
+          $ref: '#/components/schemas/Timestamp'
+        details:
+          type: object
+          additionalProperties: true
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      properties:
+        type:    { type: string, format: uri }
+        title:   { type: string }
+        status:  { type: integer }
+        detail:  { type: string }
+        instance:{ type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              path:    { type: string }
+              message: { type: string }
+      required: [title, status]
